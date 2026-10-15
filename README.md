@@ -64,11 +64,16 @@
 
 ### Claude 網頁版或 App
 
-需要 Pro、Max、Team 或 Enterprise 方案，並先開啟「程式碼執行與檔案建立」。
+免費版和付費版都可以用。
 
-1. 到 [Releases](../../releases) 下載最新版的 `shopee-fee-calc.zip`。
-2. 進入 **設定 → 功能（Capabilities）**，找到 Skills 區塊。
-3. 點 **上傳技能（Upload skill）**，選剛下載的 zip，上傳後把它打開。
+1. 到 [Releases](../../releases) 下載最新版的 `shopee-fee-calc.zip`。不用解壓縮。
+2. 進入 **設定 → 功能（Capabilities）**，打開「程式碼執行與檔案建立」。
+3. 進入 **自訂（Customize）→ Skills**，點 **＋**，選 **建立技能（Create skill）→ 上傳技能（Upload a skill）**，選剛下載的 zip。
+4. 上傳後，確認列表裡 `shopee-fee-calc` 的開關是打開的。
+
+> 公司帳號（Team、Enterprise）如果找不到上傳按鈕，是管理員還沒開放，請找管理員。
+>
+> 用 Mac 的 Safari 下載，zip 可能會被自動解壓縮成資料夾。這時用 Chrome 重新下載，或把資料夾重新壓縮再上傳。
 
 ### Codex
 

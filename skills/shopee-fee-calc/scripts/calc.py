@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""蝦皮台灣單筆訂單試算：實拿多少、每項費用扣多少、方案一和方案二哪個划算。
+"""蝦皮台灣訂單試算：這單賺多少、每項費用扣多少、方案一和方案二哪個划算。
 
 用法（單筆）：
   python3 <skill資料夾>/scripts/calc.py --price 500 --cost 200
@@ -7,6 +7,7 @@
 
 用法（批次，給 Google 試算表或 Excel 匯出的 CSV）：
   python3 <skill資料夾>/scripts/calc.py --csv 訂單.csv --out 訂單_試算結果.csv
+  算完會印出整批的合計，以及全部用方案一、全部用方案二各要多少，用來判斷該不該換方案。
 
 只用 Python 標準函式庫，Claude 和 Codex 都能直接跑。
 費率都在 references/fees.json，蝦皮改規則只改那個檔。
@@ -93,7 +94,8 @@ def load_fees(path=FEES_PATH):
                          "常見原因是少了逗號或引號")
     missing = [k for k in REQUIRED_FEES if k not in fees]
     sp = fees.get("shipping_program", {})
-    missing += [f"shipping_program.{k}" for k in ("plan1_rate", "plan2_fixed", "default_plan")
+    missing += [f"shipping_program.{k}" for k in ("plan1_rate", "plan2_fixed", "plan2_small_order_max",
+                                                  "plan2_small_order_rate", "default_plan")
                 if k not in sp]
     if missing:
         raise InputError("fees.json 少了這些欄位：" + "、".join(missing))
@@ -104,13 +106,14 @@ def load_fees(path=FEES_PATH):
               and isinstance(coins, list) and all(0 < float(c) < 1 for c in coins)
               and len(fees["commission_rate_range"]) == 2
               and 0 < float(sp["plan1_rate"]) < 1 and float(sp["plan2_fixed"]) > 0
+              and 0 < float(sp["plan2_small_order_rate"]) < 1 and float(sp["plan2_small_order_max"]) >= 0
               and 0 < float(fees["payment_fee_rate"]) < 1
               and sp["default_plan"] in ("plan1", "plan2"))
     except (TypeError, ValueError, KeyError):
         ok = False
     if not ok:
         raise InputError("fees.json 的數字不合理：費率要填小數（例如 6% 填 0.06），"
-                         "方案二金額要大於 0，default_plan 要是 plan1 或 plan2，"
+                         "方案二金額要大於 0，小額訂單門檻不能是負數，default_plan 要是 plan1 或 plan2，"
                          "檔期加收要有 rate 和 rate_mall，蝦幣回饋要是費率清單")
     return fees
 
@@ -197,6 +200,18 @@ def parse_plan(v, default_plan):
     return plan, False
 
 
+def plan_fees(goods, sp):
+    """免運專案費用（官方 18733）。
+    方案一：商品成交單價 × 數量 × 6%（不含運費）。
+    方案二：訂單金額 99 元以下收 6%，100 元以上每單固定 60 元（2026/7/1 起）。"""
+    plan1 = rm(goods, sp["plan1_rate"])
+    if goods < sp["plan2_small_order_max"] + 1:  # 99 元（含）以下
+        plan2 = rm(goods, sp["plan2_small_order_rate"])
+    else:
+        plan2 = sp["plan2_fixed"]
+    return plan1, plan2
+
+
 def calc(o, fees):
     """o: 輸入的 dict。回傳每項明細與結論。輸入有問題丟 InputError。"""
     notes = []
@@ -262,10 +277,9 @@ def calc(o, fees):
 
     plan, defaulted = parse_plan(o.get("plan"), sp["default_plan"])
     if defaulted:
-        notes.append(f"沒選方案，照平台預設算方案二（每單 {sp['plan2_fixed']:g} 元）")
+        notes.append("沒說是哪個方案，照平台預設算方案二；請到賣家中心「蝦皮活動 > 已報名」確認自己在哪個方案")
 
-    plan1_fee = rm(goods, sp["plan1_rate"])
-    plan2_fee = sp["plan2_fixed"]
+    plan1_fee, plan2_fee = plan_fees(goods, sp)
     breakeven = sp["plan2_fixed"] / sp["plan1_rate"]
 
     # 成交手續費（官方）：單件售出金額 × 數量 ×（基本費率＋檔期費率）
@@ -307,8 +321,8 @@ def calc(o, fees):
         disc = fees["coin_program_discount"]
         if abs(coin - disc["applies_to_rate"]) < 1e-9:
             coin_rate = coin - disc["rate"]
-            notes.append(f"同時參加免運專案和 10% 蝦幣回饋，官方減免 {disc['rate']:.1%}，"
-                         f"蝦幣回饋費以 {coin_rate:.1%} 計")
+            notes.append(f"同時參加免運專案和 10% 蝦幣回饋，蝦幣回饋費官方減免 {disc['rate']:.1%}，"
+                         f"以 {coin_rate:.1%} 計")
         items.append(("蝦幣回饋", rm(goods, coin_rate)))
     if preorder:
         pre_base = min(unit_sold, fees["preorder_cap_per_item"]) * qty
@@ -326,7 +340,8 @@ def calc(o, fees):
     cheaper = "plan1" if plan1_fee < plan2_fee else ("plan2" if plan2_fee < plan1_fee else "same")
     if cheaper != "same" and cheaper != plan:
         diff = abs(plan1_fee - plan2_fee)
-        notes.append(f"這單用{'方案一' if cheaper == 'plan1' else '方案二'}可以少付 {diff:g} 元")
+        notes.append(f"這單用{'方案一' if cheaper == 'plan1' else '方案二'}可以少付 {diff:g} 元"
+                     "（方案是整個賣場一起選，要看全部訂單，不是這一單）")
     if profit < 0:
         notes.append("這單虧錢")
     elif margin < 0.3:
@@ -394,7 +409,7 @@ def print_report(res):
           f"廣告 {fmt(res['廣告費'])}、其他 {fmt(res['其他成本'])} 後")
     print(f"淨利：{fmt(res['淨利'])} 元（毛利率 {res['毛利率']:.1%}）")
     print(f"方案比較：方案一 {fmt(res['方案一費用'])} 元 / 方案二 {fmt(res['方案二費用'])} 元"
-          f"（訂單商品金額 {res['打平訂單金額']:,.0f} 元打平）")
+          f"（訂單商品金額 100 元以下兩個一樣，{res['打平訂單金額']:,.0f} 元打平）")
     for n in res["提醒"]:
         print(f"提醒：{n}")
     print(f"費率版本：{res['費率版本']}，請到蝦皮賣家中心核對")
@@ -446,6 +461,7 @@ def run_csv(in_path, out_path, fees):
                    "試算_毛利率": "", "試算_方案一費用": "", "試算_方案二費用": "",
                    "試算_扣款明細": "", "試算_提醒": ""}
     out_rows, ok, bad = [], 0, 0
+    results = []
     for i, row in enumerate(rows, start=2):  # 第 1 列是標題
         values = [v for v in row.values() if isinstance(v, str)]
         if not any(v.strip() for v in values):
@@ -458,6 +474,7 @@ def run_csv(in_path, out_path, fees):
             if extra_cells:
                 raise InputError("這列的格數比標題多，常見原因是金額有逗號沒加引號（例如 1,200 要寫成 \"1,200\" 或 1200）")
             res = safe_calc(o, fees)
+            results.append(res)
             extra = {
                 "試算_狀態": "OK",
                 "試算_平台扣款合計": res["平台扣款合計"],
@@ -488,8 +505,56 @@ def run_csv(in_path, out_path, fees):
     if unused_note:
         print(unused_note)
     print(f"完成：{ok} 筆算好，{bad} 筆有問題（看「試算_提醒」欄），輸出到 {out_path}")
+    if results:
+        print_summary(summarize(results))
     print(f"讀檔編碼 {enc}，費率版本 {fees['fees_as_of']}，請到蝦皮賣家中心核對")
     return 0 if ok else 1
+
+
+def summarize(results):
+    """整批訂單的合計，以及全部用方案一、全部用方案二各要付多少。"""
+    plan1 = sum(x["方案一費用"] for x in results)
+    plan2 = sum(x["方案二費用"] for x in results)
+    current = sum(x["方案一費用"] if x["使用方案"] == "plan1" else x["方案二費用"] for x in results)
+    plans_used = {x["使用方案"] for x in results}
+    buckets = {"99 元以下": 0, "100–999 元": 0, "1,000 元以上": 0}
+    for x in results:
+        g = x["商品金額"]
+        key = "99 元以下" if g < 100 else ("100–999 元" if g < x["打平訂單金額"] else "1,000 元以上")
+        buckets[key] += 1
+    return {
+        "筆數": len(results),
+        "商品金額合計": round(sum(x["商品金額"] for x in results), 2),
+        "平台扣款合計": round(sum(x["平台扣款合計"] for x in results), 2),
+        "撥款合計": round(sum(x["撥款（實拿）"] for x in results), 2),
+        "淨利合計": round(sum(x["淨利"] for x in results), 2),
+        "虧錢筆數": sum(1 for x in results if x["淨利"] < 0),
+        "全用方案一": plan1,
+        "全用方案二": plan2,
+        "目前方案費用": current,
+        "目前方案": PLAN_NAME[plans_used.pop()] if len(plans_used) == 1 else "混用",
+        "訂單金額分布": buckets,
+    }
+
+
+def print_summary(s):
+    print(f"整批 {s['筆數']} 筆：商品金額 {fmt(s['商品金額合計'])} 元，平台扣 {fmt(s['平台扣款合計'])} 元，"
+          f"撥款 {fmt(s['撥款合計'])} 元，淨利 {fmt(s['淨利合計'])} 元，虧錢 {s['虧錢筆數']} 筆")
+    b = s["訂單金額分布"]
+    print("訂單金額分布：" + "、".join(f"{k} {v} 筆" for k, v in b.items()))
+    p1, p2 = s["全用方案一"], s["全用方案二"]
+    print(f"免運專案：全部用方案一共 {fmt(p1)} 元，全部用方案二共 {fmt(p2)} 元"
+          f"（目前{s['目前方案']}，付 {fmt(s['目前方案費用'])} 元）")
+    if p1 == p2:
+        print("方案建議：這批訂單兩個方案一樣")
+    else:
+        better = "方案一" if p1 < p2 else "方案二"
+        save = s["目前方案費用"] - min(p1, p2)
+        if s["目前方案"] == better or save <= 0:
+            print(f"方案建議：{better}比較省，你已經在用了")
+        else:
+            print(f"方案建議：這批訂單用{better}可以少付 {fmt(save)} 元。"
+                  "方案 30 天內可以換一次，建議拿一整個月的訂單來看再決定")
 
 
 def main():
