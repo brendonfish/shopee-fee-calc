@@ -1,0 +1,43 @@
+# 推 v* tag 時：跑官方範例測試、打包 skill zip，附加到 GitHub release。
+# GitHub 自動附的 Source code 是整個 repo，不能直接上傳到 Claude；這裡附的才是。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: 檢查 tag 和 SKILL.md 版號一致
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(sed -n 's/^ *version: *"\{0,1\}\([^"]*\)"\{0,1\} *$/\1/p' skills/shopee-fee-calc/SKILL.md)
+          if [ "$tag" != "$ver" ]; then
+            echo "tag 是 $GITHUB_REF_NAME，SKILL.md 版號是 $ver，請先改成一致"
+            exit 1
+          fi
+
+      - name: 測試並打包
+        run: ./build-zip.sh
+
+      - name: 建立 release 並附上 zip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/shopee-fee-calc.zip --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/shopee-fee-calc.zip \
+              --title "$GITHUB_REF_NAME" --generate-notes
+          fi

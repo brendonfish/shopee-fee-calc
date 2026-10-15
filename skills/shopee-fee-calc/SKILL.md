@@ -4,7 +4,7 @@ description: 算蝦皮台灣賣家一筆訂單實拿多少、每項費用被扣�
 license: MIT
 compatibility: 需要能執行 Python 3 的環境（只用標準函式庫）。不能執行程式時，照 references/fee-rules.md 手算。
 metadata:
-  version: "0.5"
+  version: "0.6"
   fees_as_of: "2026-09-01"
 ---
 
