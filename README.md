@@ -66,7 +66,7 @@
 
 免費版和付費版都可以用。
 
-1. 到 [Releases](../../releases) 下載最新版的 `shopee-fee-calc.zip`。不用解壓縮。
+1. [下載最新版的 `shopee-fee-calc.zip`](../../releases/latest/download/shopee-fee-calc.zip)（或到 [Releases](../../releases) 頁面找）。不用解壓縮。
 2. 進入 **設定 → 功能（Capabilities）**，打開「程式碼執行與檔案建立」。
 3. 進入 **自訂（Customize）→ Skills**，點 **＋**，選 **建立技能（Create skill）→ 上傳技能（Upload a skill）**，選剛下載的 zip。
 4. 上傳後，確認列表裡 `shopee-fee-calc` 的開關是打開的。
