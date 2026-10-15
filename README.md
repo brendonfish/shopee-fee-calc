@@ -80,10 +80,6 @@
 
 或手動：把 `skills/shopee-fee-calc` 資料夾放到 `~/.agents/skills/`，沒出現就重開 Codex。提示裡寫 `$shopee-fee-calc` 可以指定用它。
 
-### Claude Code
-
-把 `skills/shopee-fee-calc` 資料夾放到 `~/.claude/skills/`（所有專案都能用），或專案裡的 `.claude/skills/`。
-
 > Windows 電腦如果跑不動，通常是 `python3` 指令不存在，跟 AI 說「改用 python 或 py -3 執行」就好。
 
 ## 準備訂單資料
