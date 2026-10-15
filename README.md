@@ -65,8 +65,7 @@
 ### Claude 網頁版或 App
 
 需要 Pro、Max、Team 或 Enterprise 方案，並先開啟「程式碼執行與檔案建立」。
-
-1. 到 [Releases](../../releases) 下載最新版的 `shopee-fee-calc.zip`。
+1. 到 [Github Releases](../../releases/download/v0.6/shopee-fee-calc.zip) 下載最新版的 `shopee-fee-calc.zip`。
 2. 進入 **設定 → 功能（Capabilities）**，找到 Skills 區塊。
 3. 點 **上傳技能（Upload skill）**，選剛下載的 zip，上傳後把它打開。
 
