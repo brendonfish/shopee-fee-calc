@@ -112,16 +112,129 @@ REQUIRED_FEES = [
 ]
 
 
-def load_fees(path=FEES_PATH):
-    """讀 fees.json 並檢查欄位，改壞了給白話訊息。"""
+USER_FEES_NAME = "shopee-fees.json"  # 使用者自己的費率檔，放在工作資料夾就會自動用
+
+# 使用者改了哪些費率時，用白話講出來
+FEE_LABELS = {
+    "payment_fee_rate": "金流服務費率",
+    "commission_rate_default": "成交手續費率（沒指定時的預設）",
+    "commission_cap_per_item": "成交手續費單件上限",
+    "commission_cap_per_order": "成交手續費單筆上限",
+    "shipping_program.plan1_rate": "方案一費率",
+    "shipping_program.plan2_fixed": "方案二每單",
+    "shipping_program.plan2_small_order_max": "方案二小額訂單門檻",
+    "shipping_program.plan2_small_order_rate": "方案二小額訂單費率",
+    "shipping_program.default_plan": "沒選方案時的預設",
+    "campaign_surcharge.rate": "檔期加收（一般賣家）",
+    "campaign_surcharge.rate_mall": "檔期加收（商城）",
+    "coin_cashback_rates": "蝦幣回饋費率",
+    "coin_program_discount.rate": "蝦幣回饋減免",
+    "invoice_fee_per_order": "發票服務費",
+    "invoice_default": "沒指定時算不算發票服務費",
+    "preorder_rate": "預購訂單服務費率",
+    "preorder_cap_per_item": "預購單件上限",
+}
+
+
+def read_json_file(path, label):
     try:
-        with open(path, encoding="utf-8") as f:
-            fees = json.load(f)
+        with open(path, encoding="utf-8-sig") as f:
+            return json.load(f)
     except FileNotFoundError:
-        raise InputError(f"找不到費率設定檔 {path}")
+        raise InputError(f"找不到{label} {path}")
     except json.JSONDecodeError as e:
-        raise InputError(f"費率設定檔 fees.json 格式打錯了（第 {e.lineno} 行附近），"
+        raise InputError(f"{label} {Path(path).name} 格式打錯了（第 {e.lineno} 行附近），"
                          "常見原因是少了逗號或引號")
+
+
+def is_note_key(k):
+    return k == "note" or k.endswith("_note") or k == "sources"
+
+
+def merge_user_fees(base, user, prefix=""):
+    """把使用者的費率疊到內建的上面。回傳 (合併結果, 改了哪些 [(欄位, 原本, 新的)])。
+    欄位名稱打錯會報錯，不然使用者以為改了、其實沒改。"""
+    merged, changes, unknown = dict(base), [], []
+    for k, v in user.items():
+        key = prefix + k
+        if is_note_key(k) or k == "fees_as_of":
+            merged[k] = v
+            continue
+        if k not in base:
+            unknown.append(key)
+            continue
+        if isinstance(base[k], dict) and isinstance(v, dict):
+            merged[k], sub = merge_user_fees(base[k], v, key + ".")
+            changes += sub
+        else:
+            merged[k] = v
+            if v != base[k]:
+                changes.append((key, base[k], v))
+    if unknown:
+        raise InputError("使用者費率檔裡有不認得的欄位：" + "、".join(unknown)
+                         + "。欄位名稱要跟內建的 fees.json 一樣")
+    return merged, changes
+
+
+def fmt_fee_value(key, v):
+    if isinstance(v, bool):
+        return "算" if v else "不算"
+    if isinstance(v, list):
+        return "、".join(fmt_fee_value(key, x) for x in v)
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and "rate" in key and 0 < v < 1:
+        return f"{v * 100:.4f}".rstrip("0").rstrip(".") + "%"  # 0.025 → 2.5%、0.06 → 6%
+    return str(v)
+
+
+def describe_changes(changes):
+    return "；".join(f"{FEE_LABELS.get(k, k)} {fmt_fee_value(k, old)} → {fmt_fee_value(k, new)}"
+                     for k, old, new in changes)
+
+
+def find_user_fees(explicit=None, cwd=None):
+    """使用者指定的費率檔；沒指定就找工作資料夾的 shopee-fees.json；都沒有回傳 None。"""
+    if explicit:
+        return Path(explicit)
+    p = Path(cwd or Path.cwd()) / USER_FEES_NAME
+    return p if p.is_file() else None
+
+
+def parse_set_args(items):
+    """--set 的 '欄位=值' 轉成巢狀 dict。欄位用點分層（shipping_program.plan2_fixed=70），
+    值可以寫 0.03、3%、70 或 JSON（例如 [0.015,0.025]）。"""
+    out = {}
+    for item in items or []:
+        if "=" not in item:
+            raise InputError(f"--set 要寫成 欄位=值，例如 payment_fee_rate=3%，收到的是「{item}」")
+        key, raw = (x.strip() for x in item.split("=", 1))
+        raw = unicodedata.normalize("NFKC", raw)
+        try:
+            val = float(raw[:-1]) / 100 if raw.endswith("%") else json.loads(raw)
+        except ValueError:
+            raise InputError(f"--set {key} 的值「{raw}」看不懂，費率寫 0.03 或 3%，金額寫數字")
+        node = out
+        parts = key.split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = val
+    return out
+
+
+def diff_fees(base, final, prefix=""):
+    """跟內建費率比，最後改了哪些 [(欄位, 原本, 新的)]。說明文字和日期不算。"""
+    changes = []
+    for k, v in base.items():
+        if is_note_key(k) or k == "fees_as_of" or k not in final:
+            continue
+        if isinstance(v, dict) and isinstance(final[k], dict):
+            changes += diff_fees(v, final[k], prefix + k + ".")
+        elif final[k] != v:
+            changes.append((prefix + k, v, final[k]))
+    return changes
+
+
+def validate_fees(fees):
+    """檢查費率欄位齊不齊、數字合不合理，改壞了給白話訊息。"""
     missing = [k for k in REQUIRED_FEES if k not in fees]
     sp = fees.get("shipping_program", {})
     missing += [f"shipping_program.{k}" for k in ("plan1_rate", "plan2_fixed", "plan2_small_order_max",
@@ -142,9 +255,49 @@ def load_fees(path=FEES_PATH):
     except (TypeError, ValueError, KeyError):
         ok = False
     if not ok:
-        raise InputError("fees.json 的數字不合理：費率要填小數（例如 6% 填 0.06），"
+        raise InputError("費率的數字不合理：費率要填小數（例如 6% 填 0.06），"
                          "方案二金額要大於 0，小額訂單門檻不能是負數，default_plan 要是 plan1 或 plan2，"
                          "檔期加收要有 rate 和 rate_mall，蝦幣回饋要是費率清單")
+
+
+def read_user_fees(user, base, name):
+    """使用者費率檔 → 要改的欄位。只寫要改的欄位，其他照內建；fees_as_of 和說明文字不算費率。"""
+    if not isinstance(user, dict):
+        raise InputError(f"使用者費率檔 {name} 要寫成 {{\"欄位\": 數字}}，例如 {{\"payment_fee_rate\": 0.03}}")
+    st = {k: v for k, v in user.items() if k != "fees_as_of" and not is_note_key(k)}
+    merge_user_fees(base, st)  # 欄位名稱打錯就在這裡報錯
+    return st
+
+
+def load_fees(path=FEES_PATH, user_path=None, overrides=None, skipped_name=None):
+    """內建 fees.json，疊上使用者費率檔（shopee-fees.json），再疊上這次的 --set，後面的蓋前面的。
+    有疊上東西時，fees["使用者費率"] 記下來源和改了哪些，結果裡要講出來。
+    skipped_name：有使用者費率檔、但這次用 --builtin 不套用，也要講出來。檔名只留名稱，不印完整路徑。"""
+    base = read_json_file(path, "費率設定檔")
+    validate_fees(base)
+    fees, sources, notes = base, [], []
+    if user_path:
+        name = Path(user_path).name
+        user = read_json_file(user_path, "使用者費率檔")
+        fees, _ = merge_user_fees(fees, read_user_fees(user, base, name))
+        sources.append(name)
+        as_of = user.get("fees_as_of")
+        # skill 更新了、使用者卻忘了刪舊檔，舊費率會一直蓋掉新的內建費率
+        if as_of and str(as_of) < str(base["fees_as_of"]):
+            notes.append(f"{name} 的日期 {as_of} 比內建費率 {base['fees_as_of']} 舊，"
+                         "新版可能已經包含這些修改；確認後可以刪掉這個檔")
+    if overrides:
+        fees, _ = merge_user_fees(fees, overrides)
+        sources.append("這次指定的 --set")
+    fees = dict(fees)
+    validate_fees(fees)
+    if sources:
+        fees["使用者費率"] = {"來源": "、".join(sources),
+                         "修改": describe_changes(diff_fees(base, fees)) or "沒有改任何費率"}
+        if notes:
+            fees["使用者費率"]["提醒"] = notes
+    elif skipped_name:
+        fees["使用者費率"] = {"略過": skipped_name}
     return fees
 
 
@@ -422,6 +575,7 @@ def calc(o, fees):
             "發票服務費": invoice,
         },
         "費率版本": fees["fees_as_of"],
+        **({"使用者費率": fees["使用者費率"]} if "使用者費率" in fees else {}),
     }
 
 
@@ -461,7 +615,25 @@ def print_report(res):
           f"（訂單商品金額 100 元以下兩個一樣，{res['打平訂單金額']:,.0f} 元打平）")
     for n in res["提醒"]:
         print(f"提醒：{n}")
-    print(f"費率版本：{res['費率版本']}，請到蝦皮賣家中心核對")
+    print_user_fees(res.get("使用者費率"))
+    print(version_line(res["費率版本"], res.get("使用者費率")))
+
+
+def version_line(as_of, u):
+    """內建費率的日期一定照實寫，用了使用者費率另外講，不要混成一個日期。"""
+    extra = "，加上上面的使用者費率" if u and not u.get("略過") else ""
+    return f"費率版本：內建費率 {as_of}{extra}。蝦皮會改規則，請到蝦皮賣家中心核對"
+
+
+def print_user_fees(u):
+    if not u:
+        return
+    if u.get("略過"):
+        print(f"這次照內建費率算，沒有套用 {u['略過']}（--builtin）")
+        return
+    print(f"用了使用者費率（{u['來源']}）：{u['修改']}")
+    for n in u.get("提醒", []):
+        print(f"提醒：{n}")
 
 
 def normalize_header(h):
@@ -651,7 +823,7 @@ def preview_values(rows, header, key, fees, plan_values):
 HOW_LABEL = {"exact": "名稱對上", "guess": "用猜的", "manual": "你指定的"}
 
 
-def inspect_csv(in_path, fees, overrides, plan_values, as_json=False):
+def inspect_csv(in_path, fees, overrides, plan_values, as_json=False, defaults=None):
     """不計算，只列出：每欄對到什麼、值會被讀成什麼、缺什麼。給使用者確認用。"""
     rows, enc, headers = read_csv_rows(in_path)
     if not headers:
@@ -677,6 +849,9 @@ def inspect_csv(in_path, fees, overrides, plan_values, as_json=False):
         problems.append("沒有方案欄，全部照平台預設算方案二；要比較該不該換方案不受影響")
     if "cost" not in keys.values():
         problems.append("沒有成本欄，淨利會算不出來（費用照算）")
+    for i in used:
+        if i["key"] == "cost":
+            i["note"] = "當成每件成本，會乘上數量；如果是整筆的成本，請告訴我" + (f"（{i['note']}）" if i.get("note") else "")
 
     skipped = [i["header"] for i in info if i["how"] in ("unused", "ignored")]
     map_spec = ",".join(f"{i['header']}={KEY_LABEL[i['key']]}" for i in used)
@@ -688,6 +863,8 @@ def inspect_csv(in_path, fees, overrides, plan_values, as_json=False):
         "不使用的欄位": skipped,
         "要確認的事": problems,
         "確認後執行用的參數": f"--map '{map_spec}'" if map_spec else "",
+        **({"整批預設": describe_defaults(defaults)} if defaults else {}),
+        **({"使用者費率": fees["使用者費率"]} if "使用者費率" in fees else {}),
     }
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -703,13 +880,36 @@ def inspect_csv(in_path, fees, overrides, plan_values, as_json=False):
         print("要確認的事：")
         for p in problems:
             print(f"  - {p}")
+    if defaults:
+        print(f"整批預設（CSV 沒有這欄或空白時用）：{describe_defaults(defaults)}")
+    print_user_fees(fees.get("使用者費率"))
     if map_spec:
         print(f"確認後執行用的參數：--map '{map_spec}'")
     return 0
 
 
-def run_csv(in_path, out_path, fees, overrides=None, plan_values=None):
+DEFAULT_LABELS = {"invoice": "開發票", "commission_rate": "成交手續費率"}
+
+
+def describe_defaults(defaults):
+    def show(k, v):
+        if isinstance(v, bool):
+            v = "是" if v else "否"
+        return f"{DEFAULT_LABELS.get(k, KEY_LABEL.get(k, k))} {v}"
+    return "、".join(show(k, v) for k, v in defaults.items())
+
+
+def plain_num(x):
+    """寫進 CSV 的金額：整數就不帶 .0，跟扣款欄一致。"""
+    x = float(x)
+    return int(x) if x == int(x) else round(x, 1)
+
+
+def run_csv(in_path, out_path, fees, overrides=None, plan_values=None, defaults=None):
+    """defaults：命令列給的整批條件（--commission-rate、--no-invoice…）。
+    CSV 沒有那一欄、或那格空白時用它；CSV 有填就照 CSV。"""
     plan_values = plan_values or {}
+    defaults = defaults or {}
     rows, enc, headers = read_csv_rows(in_path)
     if not headers:
         raise InputError("CSV 是空的")
@@ -743,6 +943,9 @@ def run_csv(in_path, out_path, fees, overrides=None, plan_values=None):
             out_rows.append({**{k: v for k, v in row.items() if k is not None}, **blank_extra})
             continue
         o = {keys[h]: v for h, v in row.items() if h in keys}
+        for k, v in defaults.items():
+            if not str(o.get(k) or "").strip():
+                o[k] = v
         try:
             extra_cells = [c for c in (row.get(None) or []) if str(c).strip()]
             if extra_cells:
@@ -759,9 +962,9 @@ def run_csv(in_path, out_path, fees, overrides=None, plan_values=None):
             results.append(res)
             extra = {
                 "試算_狀態": "OK",
-                "試算_平台扣款合計": res["平台扣款合計"],
-                "試算_撥款": res["撥款（實拿）"],
-                "試算_淨利": res["淨利"],
+                "試算_平台扣款合計": plain_num(res["平台扣款合計"]),
+                "試算_撥款": plain_num(res["撥款（實拿）"]),
+                "試算_淨利": plain_num(res["淨利"]),
                 "試算_毛利率": f"{res['毛利率']:.1%}",
                 "試算_方案一費用": res["方案一費用"],
                 "試算_方案二費用": res["方案二費用"],
@@ -790,10 +993,14 @@ def run_csv(in_path, out_path, fees, overrides=None, plan_values=None):
         print("用猜的欄位：" + "、".join(guessed) + "（要先跟使用者確認過）")
     if use_total:
         print("沒有售價欄，用商品總價 ÷ 數量當單價")
+    if defaults:
+        print(f"整批預設（CSV 沒有這欄或空白時用）：{describe_defaults(defaults)}")
     print(f"完成：{ok} 筆算好，{bad} 筆有問題（看「試算_提醒」欄），輸出到 {out_path}")
     if results:
         print_summary(summarize(results))
-    print(f"讀檔編碼 {enc}，費率版本 {fees['fees_as_of']}，請到蝦皮賣家中心核對")
+    u = fees.get("使用者費率")
+    print_user_fees(u)
+    print(f"讀檔編碼 {enc}。" + version_line(fees["fees_as_of"], u))
     return 0 if ok else 1
 
 
@@ -825,7 +1032,9 @@ def summarize(results):
 
 def print_summary(s):
     print(f"整批 {s['筆數']} 筆：商品金額 {fmt(s['商品金額合計'])} 元，平台扣 {fmt(s['平台扣款合計'])} 元，"
-          f"撥款 {fmt(s['撥款合計'])} 元，淨利 {fmt(s['淨利合計'])} 元，虧錢 {s['虧錢筆數']} 筆")
+          f"撥款 {fmt(s['撥款合計'])} 元，淨利 {fmt(s['淨利合計'])} 元"
+          + (f"（毛利率 {s['淨利合計'] / s['商品金額合計']:.1%}）" if s["商品金額合計"] else "")
+          + f"，虧錢 {s['虧錢筆數']} 筆")
     b = s["訂單金額分布"]
     print("訂單金額分布：" + "、".join(f"{k} {v} 筆" for k, v in b.items()))
     p1, p2 = s["全用方案一"], s["全用方案二"]
@@ -852,12 +1061,12 @@ def main():
     p.add_argument("--seller-shipping", default=0, help="賣家負擔的運費")
     p.add_argument("--seller-discount", default=0, help="賣家自己給的折扣（整筆）")
     p.add_argument("--shopee-discount", default=0, help="蝦皮券、蝦幣、蝦皮補貼的折抵（整筆）")
-    p.add_argument("--commission-rate", help="成交手續費率，例如 5.5%、5.5 或 0.055")
+    p.add_argument("--commission-rate", help="成交手續費率，例如 5.5%%、5.5 或 0.055")
     p.add_argument("--plan", help="免運專案：方案一 / 方案二")
     p.add_argument("--campaign", action="store_true", help="促銷檔期")
     p.add_argument("--mall", action="store_true", help="商城賣家")
     p.add_argument("--preorder", action="store_true", help="預購／較長備貨（備貨 2 個工作日以上）")
-    p.add_argument("--coin-cashback", default=0, help="蝦幣回饋 1.5% 或 3%，沒參加填 0")
+    p.add_argument("--coin-cashback", default=0, help="蝦幣回饋 1.5%% 或 3%%，沒參加填 0")
     p.add_argument("--ad-cost", default=0)
     p.add_argument("--other-cost", default=0, help="包材等其他成本")
     p.add_argument("--no-invoice", action="store_true", help="沒用蝦皮代開發票")
@@ -868,11 +1077,32 @@ def main():
     p.add_argument("--map", help="指定欄位對應，例如 '型別=方案,金額=售價,運費=忽略'")
     p.add_argument("--plan-values", help="方案欄的特殊寫法，例如 '甲=方案一,乙=方案二'")
     p.add_argument("--json", action="store_true", help="輸出 JSON")
-    p.add_argument("--fees", default=str(FEES_PATH), help="費率設定檔")
+    p.add_argument("--fees", help="使用者費率檔（只寫要改的欄位，其他照內建）。"
+                   f"沒指定時，工作資料夾有 {USER_FEES_NAME} 就自動用")
+    p.add_argument("--set", action="append", metavar="欄位=值",
+                   help="這次臨時改某個費率，不用建檔，例如 --set payment_fee_rate=3%%。可以寫好幾個")
+    p.add_argument("--builtin", action="store_true",
+                   help=f"這次不套用使用者費率檔（{USER_FEES_NAME}），照內建費率算。"
+                   "用來比較改費率前後差多少")
     a = p.parse_args()
 
     try:
-        fees = load_fees(a.fees)
+        user_file = find_user_fees(a.fees)
+        fees = load_fees(FEES_PATH, None if a.builtin else user_file, parse_set_args(a.set),
+                         skipped_name=user_file.name if a.builtin and user_file else None)
+        # 命令列給的訂單條件。批次時當成整批預設，只收使用者真的有指定的
+        cli = {
+            "qty": a.qty, "cost": a.cost,
+            "buyer_shipping": a.buyer_shipping, "seller_shipping": a.seller_shipping,
+            "seller_discount": a.seller_discount, "shopee_discount": a.shopee_discount,
+            "commission_rate": a.commission_rate, "plan": a.plan,
+            "campaign": a.campaign, "mall": a.mall, "preorder": a.preorder, "coin_cashback": a.coin_cashback,
+            "ad_cost": a.ad_cost, "other_cost": a.other_cost,
+        }
+        defaults = {k: v for k, v in cli.items()
+                    if v is not None and v is not False and str(v) != str(p.get_default(k))}
+        if a.no_invoice:
+            defaults["invoice"] = False
         if a.csv:
             in_path = Path(a.csv)
             if in_path.is_dir():
@@ -880,24 +1110,16 @@ def main():
             overrides = parse_column_map(a.map)
             plan_values = parse_plan_values(a.plan_values)
             if a.inspect:
-                return inspect_csv(in_path, fees, overrides, plan_values, as_json=a.json)
+                return inspect_csv(in_path, fees, overrides, plan_values, as_json=a.json, defaults=defaults)
             out = Path(a.out) if a.out else in_path.with_name(in_path.stem + "_試算結果.csv")
             if out.is_dir():
                 out = out / (in_path.stem + "_試算結果.csv")
             if out.resolve() == in_path.resolve():
                 raise InputError("輸出檔不能跟輸入檔同一個，不然原始資料會被蓋掉")
-            return run_csv(in_path, out, fees, overrides, plan_values)
+            return run_csv(in_path, out, fees, overrides, plan_values, defaults)
         if a.price is None:
             raise InputError("需要 --price，或用 --csv 批次計算")
-        o = {
-            "price": a.price, "qty": a.qty, "cost": a.cost,
-            "buyer_shipping": a.buyer_shipping, "seller_shipping": a.seller_shipping,
-            "seller_discount": a.seller_discount, "shopee_discount": a.shopee_discount,
-            "commission_rate": a.commission_rate, "plan": a.plan,
-            "campaign": a.campaign, "mall": a.mall, "preorder": a.preorder, "coin_cashback": a.coin_cashback,
-            "ad_cost": a.ad_cost, "other_cost": a.other_cost,
-            "invoice": False if a.no_invoice else None,
-        }
+        o = {"price": a.price, **cli, "invoice": False if a.no_invoice else None}
         res = safe_calc(o, fees)
     except InputError as e:
         print(f"輸入有問題：{e}", file=sys.stderr)
