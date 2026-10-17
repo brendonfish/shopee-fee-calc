@@ -43,8 +43,38 @@ COLUMN_ALIASES = {
     "ad_cost": ["廣告費", "ad_cost"],
     "other_cost": ["其他成本", "包材", "other_cost"],
     "invoice": ["開發票", "invoice"],
+    # 商品總價 = 單價 × 數量（不含運費）。只有總價、沒有單價時，程式用總價 ÷ 數量當單價
+    "total": ["商品總價", "商品小計", "小計", "total"],
 }
 ALIAS_TO_KEY = {a.lower(): k for k, names in COLUMN_ALIASES.items() for a in names}
+KEY_LABEL = {k: names[0] for k, names in COLUMN_ALIASES.items()}
+
+# 欄位名稱對不上別名時，用關鍵字猜。猜到的一律要給使用者確認（--inspect）。
+# (內部參數名, 要有的字, 不能有的字, 補充提醒)
+GUESS_RULES = [
+    ("commission_rate", r"手續費率|費率|抽成", r"", ""),
+    ("coin_cashback", r"蝦幣回饋|回饋", r"", ""),
+    ("shopee_discount", r"蝦皮.*(折|券|補貼)|蝦幣折", r"", ""),
+    ("buyer_shipping", r"運費", r"賣家|賣方|自付|負擔|補貼", "這欄當成買家付的運費"),
+    ("seller_shipping", r"(賣家|賣方|自付|負擔).*運費|運費.*(賣家|賣方|自付|負擔|補貼)", r"", ""),
+    ("plan", r"方案|免運|型別", r"", ""),
+    ("qty", r"數量|件數|個數|qty|quantity", r"", ""),
+    ("cost", r"成本|進價|進貨|cost", r"其他", ""),
+    ("seller_discount", r"折扣|折價|優惠|折讓", r"蝦皮", ""),
+    ("campaign", r"檔期|促銷|大促", r"", ""),
+    ("mall", r"商城", r"", ""),
+    ("preorder", r"預購|備貨", r"", ""),
+    ("ad_cost", r"廣告", r"", ""),
+    ("other_cost", r"包材|雜支|其他成本|其他費用", r"", ""),
+    ("invoice", r"發票", r"號碼|日期|字軌", ""),
+    ("total", r"總價|總額|總金額|訂單金額|合計|小計", r"運費|撥款|手續費",
+     "當成商品總價（單價×數量，不含運費）；如果這欄有含運費，請告訴我"),
+    ("price", r"售價|單價|價格|價錢|金額|price", r"運費|撥款|手續費|成本|進價|廣告",
+     "當成單價；如果這欄其實是單價×數量的總額，請告訴我"),
+]
+# 這些欄位不用來計算，也不把內容印出來（姓名、電話之類）
+SENSITIVE_HINT = re.compile(r"姓名|名字|收件|買家帳號|帳號|電話|手機|地址|email|e-mail|備註|身分", re.I)
+IGNORE_WORDS = {"忽略", "不用", "ignore", "skip", "-"}
 
 TRUE_WORDS = {"1", "true", "yes", "y", "是", "有", "v", "要", "開", "o"}
 FALSE_WORDS = {"0", "false", "no", "n", "否", "無", "沒有", "不要", "不開", "x", ""}
@@ -181,7 +211,23 @@ def _match_plan(s):
     for plan, words in PLAN_WORDS.items():
         if s in words:
             return plan
-    return None
+    return _guess_plan(s)
+
+
+def _guess_plan(s):
+    """寫法不標準時再猜，例如「型1」「1型」「免運方案(一)」「A-方案2」「6%方案」「固定60」。
+    只認得出一個方案才回傳，兩個都像就回 None，交給使用者決定。"""
+    found = set()
+    if re.search(r"(?<![\d.])6(\.0+)?%", s) or "6趴" in s:
+        found.add("plan1")
+    if re.search(r"(?<![\d.])60(?![\d.%])", s):
+        found.add("plan2")
+    rest = re.sub(r"(?<![\d.])6(\.0+)?%|(?<![\d.])60(?![\d.%])", "", s)
+    for d in re.findall(r"(?<![\d.])([12])(?![\d.%])", rest):
+        found.add("plan1" if d == "1" else "plan2")
+    for c in re.findall(r"[一二壹貳ⅰⅱ]", rest):
+        found.add("plan1" if c in "一壹ⅰ" else "plan2")
+    return found.pop() if len(found) == 1 else None
 
 
 def parse_plan(v, default_plan):
@@ -191,6 +237,9 @@ def parse_plan(v, default_plan):
     inner = re.findall(r"[\(（](.*?)[\)）]", raw)  # 括號內容，例如「方案一（6%）」的 6%
     s = re.sub(r"[\(（].*?[\)）]", "", raw)
     plan = _match_plan(s)
+    if plan is None and inner:
+        plan = _guess_plan(raw)  # 例如「免運方案(一)」，方案寫在括號裡
+        inner = []
     if plan is None:
         raise InputError(f"方案「{v}」看不懂，請填 方案一 或 方案二")
     for i in inner:
@@ -436,27 +485,252 @@ def read_csv_rows(path):
     raise InputError(f"讀不懂這個 CSV 的編碼（{last_err}），請另存成 UTF-8 的 CSV")
 
 
-def run_csv(in_path, out_path, fees):
+def parse_pairs(spec, what):
+    """把「型別=方案,金額=售價」拆成 [(左, 右)]。逗號、全形逗號、分號都可以分隔。"""
+    pairs = []
+    for part in re.split(r"[,，;；\n]", spec or ""):
+        if not part.strip():
+            continue
+        if "=" not in part and "＝" not in part:
+            raise InputError(f"{what}「{part}」要寫成 左邊=右邊，例如 型別=方案")
+        left, right = re.split(r"[=＝]", part, maxsplit=1)
+        pairs.append((clean_text(left), clean_text(right)))
+    return pairs
+
+
+def parse_column_map(spec):
+    """--map：使用者確認過的欄位對應。右邊填標準欄位名（售價、方案…）或「忽略」。"""
+    out = {}
+    for left, right in parse_pairs(spec, "--map"):
+        if right.lower() in IGNORE_WORDS:
+            out[left] = None
+            continue
+        k = ALIAS_TO_KEY.get(right.lower())
+        if k is None:
+            names = "、".join(KEY_LABEL.values())
+            raise InputError(f"--map 的「{right}」不是認得的欄位，可以用：{names}，或填「忽略」")
+        out[left] = k
+    return out
+
+
+def parse_plan_values(spec):
+    """--plan-values：方案欄的特殊寫法，例如 甲=方案一,乙=方案二。"""
+    out = {}
+    for left, right in parse_pairs(spec, "--plan-values"):
+        plan = _match_plan(right.lower())
+        if plan is None:
+            raise InputError(f"--plan-values 的「{right}」要填 方案一 或 方案二")
+        out[left.lower()] = PLAN_NAME[plan]
+    return out
+
+
+def detect_columns(headers, overrides=None):
+    """判斷每個標題對到哪個欄位。
+    回傳 (keys, info)。keys：標題 -> 內部參數名，只含要用的欄位。
+    info：每個標題一筆 dict，how 是 exact（名稱完全對上）、guess（用關鍵字猜的）、
+    manual（--map 指定）、ignored（--map 指定不用）、conflict（跟別欄搶同一個欄位）、unused（沒用到）。"""
+    overrides = overrides or {}
+    def loose(x):  # 比對時忽略括號內容，「商品金額」也能對到「商品金額(元)」
+        return re.sub(r"[\(（\[【].*?[\)）\]】]", "", clean_text(x))
+    resolved = {}
+    for name, k in overrides.items():
+        hits = [h for h in headers if clean_text(h) == name] or [h for h in headers if loose(h) == loose(name)]
+        if not hits:
+            raise InputError(f"--map 裡的「{name}」在 CSV 標題裡找不到。標題有：" + "、".join(headers))
+        resolved[clean_text(hits[0])] = k
+    overrides = resolved
+    info, taken = [], {}
+
+    def claim(h, k):
+        if k in taken:
+            return False
+        taken[k] = h
+        return True
+
+    # 優先順序：使用者指定 > 名稱完全對上 > 用猜的
+    for h in headers:
+        c = clean_text(h)
+        if c in overrides:
+            k = overrides[c]
+            if k is None:
+                info.append({"header": h, "key": None, "how": "ignored"})
+            elif claim(h, k):
+                info.append({"header": h, "key": k, "how": "manual"})
+            else:
+                raise InputError(f"--map 把「{taken[k]}」和「{h}」都指定成「{KEY_LABEL[k]}」，只能選一欄")
+        else:
+            info.append({"header": h, "key": None, "how": "pending"})
+    for item in info:
+        if item["how"] != "pending":
+            continue
+        k = normalize_header(item["header"])
+        if k in COLUMN_ALIASES:
+            if claim(item["header"], k):
+                item.update(key=k, how="exact")
+            else:
+                item.update(how="conflict", note=f"跟「{taken[k]}」都像「{KEY_LABEL[k]}」")
+    for item in info:
+        if item["how"] != "pending":
+            continue
+        c = clean_text(item["header"]).lower()
+        if SENSITIVE_HINT.search(c):
+            item.update(how="unused", sensitive=True)
+            continue
+        for k, want, avoid, note in GUESS_RULES:
+            if re.search(want, c, re.I) and not (avoid and re.search(avoid, c, re.I)):
+                if claim(item["header"], k):
+                    item.update(key=k, how="guess", note=note)
+                else:
+                    item.update(how="conflict", note=f"跟「{taken[k]}」都像「{KEY_LABEL[k]}」")
+                break
+        else:
+            item["how"] = "unused"
+    keys = {i["header"]: i["key"] for i in info if i["key"]}
+    return keys, info
+
+
+BOOL_KEYS = {"campaign", "mall", "preorder", "invoice"}
+RATE_KEYS = {"commission_rate", "coin_cashback"}
+
+
+def preview_values(rows, header, key, fees, plan_values):
+    """這一欄的值會被讀成什麼。回傳 (說明文字, 看不懂的筆數)。"""
+    vals = [row.get(header) for row in rows]
+    vals = [v for v in vals if isinstance(v, str)]
+    nonblank = [v for v in vals if v.strip()]
+    blank = len(vals) - len(nonblank)
+    if key == "plan" or key in BOOL_KEYS:
+        counts = {}
+        for v in nonblank:
+            counts[v.strip()] = counts.get(v.strip(), 0) + 1
+        parts, bad = [], 0
+        for raw, n in sorted(counts.items(), key=lambda x: -x[1])[:8]:
+            try:
+                if key == "plan":
+                    mapped = plan_values.get(clean_text(raw).lower())
+                    plan, _ = parse_plan(mapped or raw, fees["shipping_program"]["default_plan"])
+                    shown = PLAN_NAME[plan]
+                else:
+                    shown = "是" if parse_bool(raw, KEY_LABEL[key]) else "否"
+            except InputError:
+                shown, bad = "看不懂", bad + n
+            parts.append(f"「{raw}」→ {shown}（{n} 筆）")
+        if len(counts) > 8:
+            parts.append(f"…還有 {len(counts) - 8} 種寫法")
+        if blank:
+            default = ("方案二（平台預設）" if fees["shipping_program"]["default_plan"] == "plan2" else "方案一") \
+                if key == "plan" else "否"
+            parts.append(f"空白 → {default}（{blank} 筆）")
+        return "、".join(parts), bad
+    nums, bad, bad_eg = [], 0, []
+    for v in nonblank:
+        try:
+            x, pct = parse_num(v, KEY_LABEL[key])
+            if key in RATE_KEYS and (pct or x >= 1):
+                x = x / 100
+            nums.append(x)
+        except InputError:
+            bad += 1
+            if len(bad_eg) < 3:
+                bad_eg.append(f"「{v.strip()}」")
+    if nums:
+        if key in RATE_KEYS:
+            lo_, hi_ = f"{min(nums):.2%}", f"{max(nums):.2%}"
+        else:
+            lo_, hi_ = fmt(min(nums)), fmt(max(nums))
+        text = f"{len(nums)} 筆，" + (lo_ if lo_ == hi_ else f"{lo_}–{hi_}")
+    else:
+        text = "沒有可讀的數字"
+    if blank:
+        text += f"，空白 {blank} 筆"
+    if bad:
+        text += f"，看不懂 {bad} 筆（例如 {'、'.join(bad_eg)}）"
+    return text, bad
+
+
+HOW_LABEL = {"exact": "名稱對上", "guess": "用猜的", "manual": "你指定的"}
+
+
+def inspect_csv(in_path, fees, overrides, plan_values, as_json=False):
+    """不計算，只列出：每欄對到什麼、值會被讀成什麼、缺什麼。給使用者確認用。"""
+    rows, enc, headers = read_csv_rows(in_path)
+    if not headers:
+        raise InputError("CSV 是空的")
+    keys, info = detect_columns(headers, overrides)
+    data_rows = [r for r in rows if any(isinstance(v, str) and v.strip() for v in r.values())]
+    used, problems = [], []
+    for item in info:
+        if item["key"]:
+            text, bad = preview_values(data_rows, item["header"], item["key"], fees, plan_values)
+            item["values"] = text
+            used.append(item)
+            if bad:
+                problems.append(f"「{item['header']}」有 {bad} 筆看不懂，這幾筆會標錯誤、不計算")
+    for item in info:
+        if item["how"] == "conflict":
+            problems.append(f"「{item['header']}」{item['note']}，請指定要用哪一欄")
+    if "price" not in keys.values() and "total" not in keys.values():
+        problems.append("找不到售價（或商品總價）欄，這是必填。請告訴我哪一欄是售價")
+    if "price" in keys.values() and "total" in keys.values():
+        problems.append("同時有售價和商品總價，會用售價計算，商品總價不使用")
+    if "plan" not in keys.values():
+        problems.append("沒有方案欄，全部照平台預設算方案二；要比較該不該換方案不受影響")
+    if "cost" not in keys.values():
+        problems.append("沒有成本欄，淨利會算不出來（費用照算）")
+
+    skipped = [i["header"] for i in info if i["how"] in ("unused", "ignored")]
+    map_spec = ",".join(f"{i['header']}={KEY_LABEL[i['key']]}" for i in used)
+    report = {
+        "檔案": str(in_path), "編碼": enc, "訂單筆數": len(data_rows),
+        "使用的欄位": [{"欄位": i["header"], "當成": KEY_LABEL[i["key"]],
+                    "判斷方式": HOW_LABEL[i["how"]], "讀到的值": i["values"],
+                    **({"提醒": i["note"]} if i.get("note") else {})} for i in used],
+        "不使用的欄位": skipped,
+        "要確認的事": problems,
+        "確認後執行用的參數": f"--map '{map_spec}'" if map_spec else "",
+    }
+    if as_json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    print(f"檔案：{in_path}（{enc}，{len(data_rows)} 筆訂單）")
+    print("會用到的欄位：")
+    for i in used:
+        note = f"　※{i['note']}" if i.get("note") else ""
+        print(f"  「{i['header']}」→ {KEY_LABEL[i['key']]}（{HOW_LABEL[i['how']]}）：{i['values']}{note}")
+    if skipped:
+        print("不使用的欄位（不會拿來計算，內容也不列出）：" + "、".join(skipped))
+    if problems:
+        print("要確認的事：")
+        for p in problems:
+            print(f"  - {p}")
+    if map_spec:
+        print(f"確認後執行用的參數：--map '{map_spec}'")
+    return 0
+
+
+def run_csv(in_path, out_path, fees, overrides=None, plan_values=None):
+    plan_values = plan_values or {}
     rows, enc, headers = read_csv_rows(in_path)
     if not headers:
         raise InputError("CSV 是空的")
     if not rows:
         raise InputError("CSV 只有標題列，沒有訂單資料")
-    keys, seen = {}, {}
-    for h in headers:
-        k = normalize_header(h)
-        if k in ALIAS_TO_KEY.values():
-            if k in seen:
-                raise InputError(f"「{seen[k]}」和「{h}」對到同一個欄位，請只留一欄（或先合併成一欄）")
-            seen[k] = h
-            keys[h] = k
-    if "price" not in keys.values():
-        raise InputError("CSV 找不到「售價」欄，第一列要是標題，例如：售價,數量,成本")
+    keys, info = detect_columns(headers, overrides)
+    conflicts = [i for i in info if i["how"] == "conflict"]
+    if conflicts:
+        raise InputError("；".join(f"「{i['header']}」{i['note']}" for i in conflicts)
+                         + "。請用 --map 指定要用哪一欄，另一欄填「忽略」")
+    if "price" not in keys.values() and "total" not in keys.values():
+        raise InputError("CSV 找不到「售價」欄，第一列要是標題，例如：售價,數量,成本。"
+                         "欄位名稱不一樣的話，先用 --inspect 檢查，再用 --map 指定")
+    use_total = "price" not in keys.values()
+    guessed = [f"「{i['header']}」當成{KEY_LABEL[i['key']]}" for i in info if i["how"] == "guess"]
 
-    # 只提醒「看起來跟計算有關」但名稱對不上的欄位，訂單編號、客人姓名這類不吵
+    # 只提醒「看起來跟計算有關」但沒用到的欄位，訂單編號、客人姓名這類不吵
     related = re.compile(r"費|運|成本|率|價|折|方案|數量|檔期|蝦幣|發票|商城")
-    unused = [h for h in headers if h not in keys and related.search(clean_text(h))]
-    unused_note = ("沒用到的欄位：" + "、".join(unused) + "（名稱對不上，請改成說明裡的欄位名）") if unused else ""
+    ignored = {i["header"] for i in info if i["how"] == "ignored"}
+    unused = [h for h in headers if h not in keys and h not in ignored and related.search(clean_text(h))]
+    unused_note = ("沒用到的欄位：" + "、".join(unused) + "（名稱對不上，請用 --map 指定）") if unused else ""
     blank_extra = {"試算_狀態": "空白", "試算_平台扣款合計": "", "試算_撥款": "", "試算_淨利": "",
                    "試算_毛利率": "", "試算_方案一費用": "", "試算_方案二費用": "",
                    "試算_扣款明細": "", "試算_提醒": ""}
@@ -473,6 +747,14 @@ def run_csv(in_path, out_path, fees):
             extra_cells = [c for c in (row.get(None) or []) if str(c).strip()]
             if extra_cells:
                 raise InputError("這列的格數比標題多，常見原因是金額有逗號沒加引號（例如 1,200 要寫成 \"1,200\" 或 1200）")
+            if isinstance(o.get("plan"), str):
+                o["plan"] = plan_values.get(clean_text(o["plan"]).lower(), o["plan"])
+            if use_total:
+                total, _ = parse_num(o.get("total"), "商品總價")
+                q, _ = parse_num(o.get("qty"), "數量", default=1)
+                if q <= 0:
+                    raise InputError(f"數量「{o.get('qty')}」要是 1 以上的整數")
+                o["price"] = total / q
             res = safe_calc(o, fees)
             results.append(res)
             extra = {
@@ -504,6 +786,10 @@ def run_csv(in_path, out_path, fees):
         w.writerows(out_rows)
     if unused_note:
         print(unused_note)
+    if guessed:
+        print("用猜的欄位：" + "、".join(guessed) + "（要先跟使用者確認過）")
+    if use_total:
+        print("沒有售價欄，用商品總價 ÷ 數量當單價")
     print(f"完成：{ok} 筆算好，{bad} 筆有問題（看「試算_提醒」欄），輸出到 {out_path}")
     if results:
         print_summary(summarize(results))
@@ -577,6 +863,10 @@ def main():
     p.add_argument("--no-invoice", action="store_true", help="沒用蝦皮代開發票")
     p.add_argument("--csv", help="批次輸入 CSV")
     p.add_argument("--out", help="批次輸出 CSV（預設放在輸入檔旁邊）")
+    p.add_argument("--inspect", action="store_true",
+                   help="搭配 --csv：不計算，只列出每欄對到什麼、值會被讀成什麼，給使用者確認")
+    p.add_argument("--map", help="指定欄位對應，例如 '型別=方案,金額=售價,運費=忽略'")
+    p.add_argument("--plan-values", help="方案欄的特殊寫法，例如 '甲=方案一,乙=方案二'")
     p.add_argument("--json", action="store_true", help="輸出 JSON")
     p.add_argument("--fees", default=str(FEES_PATH), help="費率設定檔")
     a = p.parse_args()
@@ -587,12 +877,16 @@ def main():
             in_path = Path(a.csv)
             if in_path.is_dir():
                 raise InputError(f"{in_path} 是資料夾，請給 CSV 檔案")
+            overrides = parse_column_map(a.map)
+            plan_values = parse_plan_values(a.plan_values)
+            if a.inspect:
+                return inspect_csv(in_path, fees, overrides, plan_values, as_json=a.json)
             out = Path(a.out) if a.out else in_path.with_name(in_path.stem + "_試算結果.csv")
             if out.is_dir():
                 out = out / (in_path.stem + "_試算結果.csv")
             if out.resolve() == in_path.resolve():
                 raise InputError("輸出檔不能跟輸入檔同一個，不然原始資料會被蓋掉")
-            return run_csv(in_path, out, fees)
+            return run_csv(in_path, out, fees, overrides, plan_values)
         if a.price is None:
             raise InputError("需要 --price，或用 --csv 批次計算")
         o = {

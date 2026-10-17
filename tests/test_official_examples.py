@@ -79,6 +79,34 @@ def main():
         ok = got == expected
         failed += not ok
         print(f"{'OK ' if ok else '錯 '} {desc}：應 {expected}，算出 {got}")
+    # 欄位判斷：寫法不標準的方案、欄位名稱
+    for raw, expected in [("型1", "plan1"), ("1型", "plan1"), ("免運方案(一)", "plan1"),
+                          ("6%方案", "plan1"), ("型2", "plan2"), ("固定60元", "plan2"),
+                          ("方案二（60元）", "plan2")]:
+        got = calc.parse_plan(raw, "plan2")[0]
+        ok = got == expected
+        failed += not ok
+        print(f"{'OK ' if ok else '錯 '} 方案寫成「{raw}」：應 {expected}，讀成 {got}")
+    for raw in ("甲", "方案1/2"):
+        try:
+            calc.parse_plan(raw, "plan2")
+            ok = False
+        except calc.InputError:
+            ok = True
+        failed += not ok
+        print(f"{'OK ' if ok else '錯 '} 方案寫成「{raw}」看不懂要報錯，不能亂猜")
+    headers = ["訂單號", "收件人", "手機", "商品金額(元)", "件數", "進貨價", "方案型別", "運費", "賣家負擔運費"]
+    keys, _ = calc.detect_columns(headers)
+    for h, expected in [("商品金額(元)", "price"), ("件數", "qty"), ("進貨價", "cost"),
+                        ("方案型別", "plan"), ("運費", "buyer_shipping"), ("賣家負擔運費", "seller_shipping"),
+                        ("收件人", None), ("手機", None)]:
+        ok = keys.get(h) == expected
+        failed += not ok
+        print(f"{'OK ' if ok else '錯 '} 欄位「{h}」：應 {expected}，判斷成 {keys.get(h)}")
+    keys, _ = calc.detect_columns(headers, calc.parse_column_map("運費=忽略,商品金額=售價"))
+    ok = "運費" not in keys and keys.get("商品金額(元)") == "price"
+    failed += not ok
+    print(f"{'OK ' if ok else '錯 '} --map 可以忽略欄位、可以省略標題的括號")
     print("全部通過" if not failed else f"{failed} 題沒過")
     return 1 if failed else 0
 
